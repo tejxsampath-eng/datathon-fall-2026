@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<!--
+  India Care Map — single-page frontend
+  =====================================
+  This page uses Leaflet (https://leafletjs.com), a free map library, with
+  free OpenStreetMap tiles to draw an interactive map of India.
+
+  How it fits together:
+    - The form at the top-left sends the typed address + issue to our Flask
+      backend at POST /api/submit.
+    - The backend geocodes the address (India only) and looks up a matching
+      issue in a Databricks table.
+    - Back here, we fly the map to the location, drop a marker whose popup
+      shows the matched issue statement, and repeat it in the side panel.
+    - Markers stay on the map until you click "Clear markers".
+    - "My data": orange dots from data.csv in the app folder — the file
+      travels with the app, so the dots are just there when you open it
+      (edit data.csv, redeploy, refresh — see data-template.csv).
+    - If the address can't be found, the app fuzzy-matches it against
+      every location name in data.csv (cities, states, facility names)
+      and offers clickable "Did you mean …?" suggestions. Each carries
+      its own coordinates, so clicking one always lands on a real place
+      in India — no geocoding needed.
+    - Submitting the form also finds the BEST NEARBY facilities from
+      data.csv, ranked by a priority function (a placeholder "black
+      box" in app.py you can rewrite later) — shown as ranked blue dots
+      plus a numbered list in the panel. All facility positions are
+      geocoded ahead of time in data.csv, so the only live geocode is
+      the user's typed address and searches stay fast (~2 seconds).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>India Care Map</title>
+
+  <!-- Leaflet CSS + JS from a public CDN (no install needed) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    /* ---- Simple, clean layout that fills a laptop screen ---- */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      height: 100vh;            /* fill the whole browser window */
+      display: flex;
+      flex-direction: column;   /* header on top, content below */
+    }
+
+    header {
+      background: #16213e;
+      color: #fff;
+      padding: 12px 20px;
+      font-size: 20px;
+      font-weight: 600;
+    }
+
+    #layout { flex: 1; display: flex; min-height: 0; }
+
+    /* ---- Left panel: the form and the results ---- */
+    #panel {
+      width: 340px;
+      padding: 16px;
+      background: #f7f8fa;
+      overflow-y: auto;         /* scroll if content gets long */
+      border-right: 1px solid #e0e3e8;
+    }
+
+    label { display: block; margin: 12px 0 4px; font-weight: 600; font-size: 14px; }
+
+    input[type="text"], textarea {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #c4c9d2;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+
+    button {
+      margin-top: 12px;
+      padding: 8px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #submit-btn  { background: #2962ff; color: #fff; }
+    #submit-btn:disabled { background: #9db4ff; }
+    #clear-btn   { background: #e0e3e8; color: #333; margin-left: 8px; }
+
+    /* Status line ("Searching..." or error messages) */
+    #status { margin-top: 12px; font-size: 13px; min-height: 18px; }
+    #status.error { color: #c62828; font-weight: 600; }
+
+    /* Result card shown in the side panel */
+    #result {
+      margin-top: 12px;
+      background: #fff;
+      border: 1px solid #e0e3e8;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+      display: none;            /* hidden until there is something to show */
+    }
+    #result h3 { font-size: 14px; margin-bottom: 6px; }
+    #result .muted { color: #667; font-size: 12px; }
+
+    /* The AI's one-line read of the patient's problem */
+    #result .ai-read {
+      margin-top: 8px; padding: 8px; background: #eef4ff;
+      border: 1px solid #d3e2fa; border-radius: 6px; font-size: 13px;
+    }
+    #result .ai-read em { color: #1a4f9c; font-style: normal; font-weight: 600; }
+    /* Which of the needed services each facility actually has */
+    #result ol li .matched { color: #1a4f9c; font-size: 12px; }
+
+    /* "My data" section: built-in points from data.csv */
+    .section-title { margin-top: 20px; font-weight: 600; font-size: 14px; }
+    #data-clear-btn { background: #e0e3e8; color: #333; }
+    #data-status { margin-top: 8px; font-size: 12px; color: #667; min-height: 16px; }
+
+    /* The map takes all the remaining space. */
+    #map { flex: 1; background: #d7e3f0; }
+
+    /* ---- Recommendation cards that pop up over the map after a search.
+       The container lives inside #map, so it sits on the map itself. */
+    #rec-cards {
+      position: absolute;
+      bottom: 18px; left: 18px;
+      z-index: 1100;              /* above every Leaflet pane and control */
+      width: 350px;
+      max-height: 70%;
+      overflow-y: auto;           /* many cards -> scroll, never cover the map */
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: auto;
+    }
+    #rec-cards .rec-header {
+      background: #1a2b4a; color: #fff;
+      border-radius: 8px; padding: 10px 12px;
+      font-size: 13px; line-height: 1.45;
+      position: relative; padding-right: 30px;
+      flex-shrink: 0;   /* keep natural height so the stack scrolls instead */
+    }
+    #rec-cards .rec-header .close {
+      position: absolute; top: 5px; right: 7px;
+      background: none; border: none; color: #fff;
+      font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 4px;
+      margin: 0;
+    }
+    #rec-cards .rec-header em { font-style: normal; font-weight: 700; }
+    #rec-cards .rec-card {
+      background: #fff; border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+      padding: 12px; font-size: 13px; line-height: 1.45;
+      flex-shrink: 0;   /* KEY: without this, flex squishes tall cards (and
+                           their open explanation blocks) to fit max-height,
+                           which is why long text looked "cut off" and the
+                           container never scrolled. With it, #rec-cards'
+                           overflow-y: auto actually kicks in. */
+    }
+    #rec-cards .rec-card h4 { margin: 0 0 2px; font-size: 14px; color: #16324f; }
+    #rec-cards .rec-card .muted { color: #667; font-size: 12px; }
+    #rec-cards .rec-card .addr { margin-top: 2px; }
+    #rec-cards .rec-card .chips { margin: 6px 0; }
+    #rec-cards .rec-card .chip {
+      display: inline-block; background: #eef4ff; color: #1a4f9c;
+      border-radius: 10px; padding: 1px 8px;
+      font-size: 11px; margin: 1px 3px 1px 0;
+    }
+    #rec-cards .rec-card .scores { margin: 4px 0 2px; }
+    #rec-cards .rec-card .contact { margin: 6px 0 2px; }
+    #rec-cards .rec-card .contact a {
+      color: #1976d2; text-decoration: none; margin-right: 10px;
+    }
+    #rec-cards .rec-card .reason {
+      margin-top: 6px; padding: 6px 8px;
+      background: #f4f6fa; border-left: 3px solid #1976d2;
+      border-radius: 4px; color: #334;
+    }
+
+    /* Collapsible "how these scores were computed" breakdown: the
+       backend recreates each score from the scoring scripts and
+       explains the weights; it can be long, so it starts folded. */
+    #rec-cards .rec-card details.explain {
+      margin-top: 6px; font-size: 12px;
+    }
+    #rec-cards .rec-card details.explain summary {
+      cursor: pointer; color: #1976d2; font-weight: 600;
+    }
+    #rec-cards .rec-card .explain-body {
+      margin-top: 4px; padding: 6px 8px;
+      background: #f8fafc; border-left: 3px solid #90a4ae;
+      border-radius: 4px; color: #445; line-height: 1.55;
+      max-height: 250px; overflow-y: auto;   /* long breakdowns scroll inside the card */
+    }
+    #rec-cards .rec-card .explain-body p { margin: 4px 0; }
+    #rec-cards .rec-card .explain-body p strong { color: #16324f; }
+
+    /* During the fly-to after a search, Leaflet stretches the vector
+       pane with the zoom animation, which makes every dot balloon to a
+       giant size mid-flight. The JS adds the class "dots-hidden" to the
+       overlay pane itself (see overlayPane below), so the selector
+       matches the pane that gets the class. */
+    #map .leaflet-overlay-pane { transition: opacity 0.25s ease; }
+    #map .leaflet-overlay-pane.dots-hidden { opacity: 0; }
+  </style>
+</head>
+<body>
+
+  <header>India Care Map</header>
+
+  <div id="layout">
+    <!-- ============ Left panel: inputs + results ============ -->
+    <aside id="panel">
+      <form id="issue-form">
+        <label for="address">Address (India)</label>
+        <input type="text" id="address" placeholder="e.g. Connaught Place, New Delhi"
+               autocomplete="off" required>
+
+        <label for="issue">What is the problem? (describe it in your own words)</label>
+        <textarea id="issue" rows="3"
+                  placeholder="e.g. helping a pregnant woman near Nashik — her doctor said the delivery could be risky…"
+                  required></textarea>
+
+        <button type="submit" id="submit-btn">Submit</button>
+        <button type="button" id="clear-btn">Clear markers</button>
+      </form>
+
+      <!-- ====== Healthcare facilities: the dots from data.csv in the app folder ====== -->
+      <div class="section-title">Healthcare facilities</div>
+      <div id="data-status"></div>
+      <!-- Flips between showing and hiding the healthcare facilities. -->
+      <button type="button" id="data-clear-btn">Show healthcare facilities</button>
+
+      <!-- Small line for progress / error messages -->
+      <div id="status"></div>
+
+      <!-- The matched issue statement is repeated here -->
+      <div id="result"></div>
+    </aside>
+
+    <!-- ============ The map ============ -->
+    <!-- #rec-cards holds the recommendation cards that pop up over the
+       map after a search (filled in by the JS below). -->
+    <div id="map"><div id="rec-cards"></div></div>
+  </div>
+
+  <script>
+    // ------------------------------------------------------------------
+    // 1. Create the map, centered on India, with the view limited to the
+    //    region around India. INDIA_BOUNDS is a rough rectangle covering
+    //    all of India (Kanyakumari to Kashmir, Gujarat to Arunachal).
+    //      - fitBounds: on load the map zooms so India fills the screen.
+    //      - maxBounds + maxBoundsViscosity: you cannot drag the map past
+    //        this region's edges (1.0 = it stops dead at the border).
+    //      - minZoom: you cannot zoom out far beyond an India-sized view.
+    // ------------------------------------------------------------------
+    // The exact edges of India, measured from its border data:
+    //   south 6.75N (Indira Point, Nicobar Islands)
+    //   north 37.1N (Siachen area)
+    //   west  68.16E (Sir Creek, Gujarat)
+    //   east  97.4E (Arunachal Pradesh)
+    // The box starts a little past each edge, so it completely surrounds
+    // every part of India — mainland, Kashmir, Kutch, Arunachal, and the
+    // Andaman & Nicobar Islands — and every bit of it can be reached by
+    // panning, while the view still can't wander off to other regions.
+    const INDIA_BOUNDS = L.latLngBounds([5.5, 67.0], [38.5, 99.0]);
+    const map = L.map("map", {
+      maxBounds: INDIA_BOUNDS,            // the view cannot leave this box
+      maxBoundsViscosity: 1.0,            // cannot pan outside the box at all
+      minZoom: 4,                         // cannot zoom out past an India-sized view
+      maxZoom: 18,
+    }).fitBounds(INDIA_BOUNDS);           // start with the whole box in view
+
+    // ------------------------------------------------------------------
+    // 1b. INDIA ONLY: everything outside India's border is covered by a
+    //     mask, so neighboring countries and open ocean never appear.
+    //     The border itself (mainland + islands, from India border data
+    //     simplified to ~2 km) is stored in INDIA_MASK_DATA: a gzipped,
+    //     base64 string of "lat,lng,lat,lng,..." with rings separated by
+    //     ";" — decoded right in the browser. One polygon covering the
+    //     whole world with India's rings as holes is filled with the
+    //     map's background color; a second polygon strokes the border.
+    //     Both sit on a custom pane BETWEEN the tiles and the dots
+    //     (tiles 200 < mask 350 < dots 400), so markers, facility dots
+    //     and cards still draw on top of it.
+    // ------------------------------------------------------------------
+    const INDIA_MASK_DATA = "H4sIABi3AmsC/12dWZIsKw5EN3TtGfNguf99dciPE0H1V6UXhJiFkIQo6b+Z/83031r5X3lAa4F23kJlKm12oa601atQ6qS1QGNDpRSlPZ8HypOcpCXljD8P6nX8K/m/9Px5UF4BWu//xv5vzi00WqD1lCNEkkAvSyhXoSd/oCf/gwY0qiiOqqQxVdhIlc+mPttCYwuNBqomWZSzgKAyc4bmVM5UhEoO1NdTnr7J86FX/itPBcb6b3ehmkDR6PJfy01odSG1JQ1lbFXVSM8wxGd7kLaVVtQheZOWlTP3peK6qJSo/oO2KlWLMipfrXxVla+puv/VJfq9NMoWaltpLakje8/K2ck5IDlo9CYtq3v6HFedx6bOPTMA+q7NRrdSgn67tKbSVvFXk7R50Vi0rScj6tyZJO7Ypu+WP1NFdlbGTnftSp9vFefR8XTaTUQ6M2HTnN6LJuhQ4eP586DShGYFddAzBA+qzyQr9b80tTzaBlUtgZbUYbuRk3puEalN/bC3kjK9srtWR8nqlT1EJBeTFKDsPUG5QH+SEfpdaYnB2kX1ysyNRdd6EKaXVVIfTfpo0NFzMOtbpq2sK9ozd2Gq8B2D3FR4DGjMvq7OXC0zg7NaoDURpB5QYvWsZx11IS2QvkmKoVtPRTJJoOAmD5oCMb0eEFMvMl5gFhGslbIWSZMkkYgBi6+oR33yBxr7T5ro14dHqughFH2w4ANVgxlVpgRN0vWMvtJGFc22RDO4aZQ+1JzVr9bMLtQLGalKz2rBzjSV1u1EU4uI7EbnbVVsF1Vaa7VqMgR6uFagoZyzPSW0/8pqVKUFMpNaZSjNKOZle4ZMVNYUKlMoSAcqcKmYDA8aGvEUE/9BVZOovF89c4Fs8Pruj+Z659NT2ISHx9A9CI6+56YizOZOA9h2chZqbDtd9W/sOiOr7No07YOvq/ACatRfOafb3dnzdrsKWKtDRetxD8CT8dnB6IQa9crPmlPGFus9v/V6hidyJnVebyIZK/1Bg5xJ9RqLz5JIBq+KjE/VS/8vszOrXv2ZbmrqmEKxhwUaQ2gop1K89wbD7Q+lBid4so2HQ4FWDVTooDyFguuL6y2hrcLSGCCt9hXTcjwzaTGOyrkSW8gzr8r8L2UNeLDeB3kce0yh+ZSgrkx5BApuLm72NHypo4IlRnkrukaDKiLBzdXuwmfuBZGMfT3GsQsNOOmiKoshKFNU1jNHZ4gKyhm7wIPWVuHBNR+0Y7dZzyJ/qJRHPmmBxtOEGbt5CRTLJlDMjWfCx3dFS7EEL3xQsKccaD+77oPqM5kq/fig+XCMGqKP0H4KelB51ueHatQzOIa+a7H5VE2LQF009/PPijg127MpNKGHgQSaojKe/g9E6VOgrCLwDHCgAVqkbVUsVv6D6jNCQiqgUlysByGl7WdOPqg/razPVIZmcMJATWlDv59Ri99PMQ/KMfMf9HAFIVHsz6YTOXcG8d2C/hjkVON6Us4Czf7IZlVSYpB8xuABwVu+zzrVChbzoJDs9JkKd3Ninj9IW2R7lo6qGUMhRFpX2gpUnsaBovseNIRiigaKMejPXO5C0bXPIo7OLHTRg4Zy5pi3D9rO2QKFJBdpXVQqNMuz5i5U9F3sQzUkuyKkz0JUDJJrg7LQwwWq5M2o1yLj1lcJwIiHMKEkdeaqHVQZuxlo5Px2dNE60kiqcTOD9BkjF/wpAJ3ur6a/ojGzMViVtCXUhijuJCqNnLswLZ/GVPGPQF2gMX+TUPTug0ImCrRVWgoaz7rsLBAlxSKNjNEJFbYee1AOFEJkoGj2s61PFtIAdGioItPrVklLVYx1HmDoq6Ky9mwsuKesWK5U+Nl5AjG38jN2gQpE0nhzPrSeVgSKoh+0lFYyZcdCCtIdpLQ6+GwLwIaCFwaKZldxsRqdC1OCiMb+/a63CepCEzbUVJXRYF9F32kjCqYEoF8pDmaSlG2qRzoEloYiZM8Kb9AayhDXxE15gzTfi2qhGdjhXFFDlolrGG3pEnIi5/PV0EFTNGqgTNkzGNfQsSRQTMghuSnQCDAWlVe+2TRq0VYhkd8x8iPOHAGCN42HIT4oVtVDMLbBJRRrcmrtB4rBntrxHiRW9exLMfT9Wa/6bseE7FqvU4KbwEPk2aSSMtYtki6uRicEUs4S++bSmniQ2OtibsXiJ21Vxklp5QzoDlSZaXFkflA7na7v+mA6xUJ/pECBWHQBGGxx+meH9OQFaAmFcBqAVRkT4QFLi3IsvtkCEJ9ak23po+AfFcl+cmIOFHx2a0lomedAeYGm0p5ZFHwDULs4zFokNXHIFc2MM4tyTtHvsNIxRbHDq8czgQM1cbe+BkTMWJVWswroRSTjYB4oi0oxow3WtCVqBOeOztqMaYgT+i5RsdrUcq3tOD93+kvVHNEPIcuPt2ZxIgB5pFzPrpyNmjWjSq3p6J4pr+u7RmtLc06lFRXeDbKmSShRzja1JFAHKhQurs/Qs+luNSb4woPGJi1ElkC0TL+zSlpV+SQvx2mNHX7RBWzcrTObkBok8kdp2vDjtKZJo5zVM0i7eKG6mz29UsnY9gONcmZ1jkOsxkLVim7QqEFjK62QVrpGtNCYUhntiaDTmHj6Hb39/F6SUMQgYn5WkPIFLwihajZmIahpVvSlxiRm4WyFnPpudcmFa2s27Qx6xK+VJIVJwAugjS60c1WoTyRBZSxFGYOPCwnod5YsGbq2SEAojMot1BqSSEWiF6XFagi0RPDp4hVFKmMoTJbOPAGKqrGzUB6iv4ZqH10d6Ck05OYmNBFBow8CxUl2S0pbPgkEUs6RJJlPGtNCvt86ogSqyjm7WlCVFNrCSCqI8M+kUuM2Ar2qWUMxt7VaAnWJ923SW0skm3Mm5QzFVqQ1VSWE6UjLyhk8M9K2SohjaCBljE0zQJxXtmZNoEpa9YAMocQwNiH3SmR5Tiib4pLOUbG5BJhKmnRYnITjYAPJ0OsFotujIWVJAxYDGWdZjkCBomsftESFY9togA0RWiBFytLEDbRVXIjkMXb6rFOvyWehfdR0EOgGE1Q0bahIfXotUNXJLGr+oBCFHlSW0tRfS7qLB9WitFwrSKCJZJ1qaahuhTgIDqW1xil06bPGiXEp40ycLbvQCnVenC0D7ELGoorsCXhIPAK+wIiFhG4zjq5P3VaIzjoaB/VyzrE96atZJygH2lXn39i9VpVsEyjWX2yBAaKV9T9nywLB/gNNfRSH0UBDaGSRDwXHqlp+gZYI7qSK1GfsFuqr+K5skMAzCKvpyBN1fGg9iLbEQgkZcFHfEqhkiu6gPiisC+1K9VegUVTlOPcEIi00LoGaFBD72QVXiHIDlYPKW9HwEf0eIFQm4z/y7QHIoCmtRXT4IxUNfRR8dCGuBRpKk0L2QU8XBgpd1GANdTFDaUJyoFqF1lTOWFiRFoV3BvERKmOgAqkBQ5/JqjJ0ShVSVUKhs4a0x5EWi20EU9ZXO0Dlq6qU3lTlYHSBUOUEN3tQbLOBunJOFDuxoz1oUeU2lHOhHgoh+kGbSsa5bCHKqiZdaJqmAL3cnjWxUPYEekb6QbHfPqhOpRUKD433mpJw9B1oqqlNGWNuRsYlIiO5zirODciq1iSj5vKUOloZR6BQcQdaoA3KKi2WZxQQPG3pjKXvphBzIxQrKwTuzIhnoc3U0Gd5qr82oIhGmHYCsWgTNOAWoROMor1KSRlCYXJRPlAVWJrzcSBTkmZ58MoHoQMrbyWisY36icJyGpoz10+V2CEJBA8Va2uiHUJ2oJgTiHnilipJeualAQ80UNNN1TD6JFBWYbLSTDEoIao1RCXOq4GyOjjqGoxwqLzV4G/0aVgbvg4JbUt0VlE9t3nCJI2mhhimnOIsuX01e1CihMkwUbH5MY+FufNBRc3b8IFnPq9Q6ynjMmLgY65u9Y14wgwkNhaTYgTSHoI+dIVIwHdZqINCil/7sLHQPgfKWkWzCs0Ov4itbkuujbTYEBD3lFOlL+oc0tBO0vQEehZToEXpT3/vJF4a6OmwnVBlPm19/jyo0aCkz2hPcIqddF4TxYf+s+l2eGMRYKE8M2rnl/s9f3bWohb3E9iVj3KgYfb6jHAgD07WZwuVtKpYdFJWx24hSnvGbaM5i/X1TJpIqiywpysCFU3EEGj32XTLM60CKF+Ia0GjZCYXSZ21R8lspW2oxnG21/YZAP1z7M1bZxd9Q1M8kadQZyKHWTkQW/oczsmSVZvFuwOpG8dgbWd9hliwVIvFAo5hDzQQH7IIbuo7lbRRfId57XRikBeiySrrAdRjTqFqhXxRJzb6LY7HgUykKa2z1jSeD6Ime6mAac4y9J1sVsF7NGga6yX9xIMWghe/yyBFwxnqpkAM5x6gZ83tyv8f2vWV/xKogJ5/7orddOl4EgiRrykpw+xCjI2kORBZA1Rk59BmPsjiX2zZgSZ2gAWypBudWh+O6TShSWnB3QJN1X4+3bmrDmUFq+UOjYhKiNW9G1a0JUtppNEHoXV+0nLH0hClNxbylmgViMNH2IN36EMnR4oZKKxRQjuQJuGWtmiHhMVRJMprUv8FlaHyZBbeMn48KCSaAtfbneW1ZS960jZnq1Bv767zv1CAwhkpxWTrWoGBqjKGvV5NENicZ6KWXTrHqBdpndNaySLSOfloZnSsxMF/Awwyhr35QZPjYKW0SQEh+D5IDi9b6pYHbTosRKD9CFyLwh9RY4dpTCe58pS6hywgKm4KbXdDFuIQlpWxcCDbouHDWlhkAmWGdYEWqIpibqAkIvn0V4E+KBjqI5oUcj5b0x46hAYaKk8OHqE3Ur18dgtbWCAm+ITKyEy/ohLUtZzrRLNyOgRtTduY51EXpm0c8wORM04aajrLkJpJpls6OqvHWJRZpYc8GmiotYNF3qiLBYuQGgOx9CqjsKBS6erYxpXz355YnpdO1Q/KfBYrfE+ZvcRhcqDGWgvfjh2ymGUcUQljuJAARIK7xGe5w+oGaeLpITUHWkheKrvCZzfkEWK2SvaZZ5KUU4FVU32Smkj4SCVWMSS2BSqZPuCAqC4PE6P2KhBHvWAYQZ9NKDQFgZAhM4OzEBxDJg+0OPh10qhXyN8xAMiRYZPUtGF7hUpHJgvVp6ZNZoNl+Xhb3hoqn1VTZ9kZaSEv25BjRsXpKCMSaFnPT3bo2PSH9IPiDUrTRw2BfrD85YoT4pN4SOF0FAen4FFIFU1cw5btusReMjIM7EviQXAEgSUD+x6gBDI/LLK3D7UrmidLvHisxqZLVxp8NKZIl2QQaamDxH9XU1q4JwXKotngxoPvwtFk4zdQOHsGT1/4CFSlhUa4dImuQvItiLmzsWoGij28yVGvNHb0BvNssAIsLIHyZNfIuCsorePEEVwm9hdohplRSJ4T2jPiZBXOEVP9ELw2UAWVgQOMeiXbHaaB8HEKqXtjcAvfFe3Vu8tVZmu/D4m6xKbJLtvlNxE2vgcd3xhtuQOvrM1OPSDRQEl9kNiNm51OsuiL4VbpeyQZXEVXnJPm4LMkJ50wF0loEApnPuWceAgtpWW8jhAo5ONQZdNWTqWFzS+kkr1u1HH7EsjO2EQy4xkX4l+gge8YLQjK4XklcSLhlDfprrTlA9bplIzLYRz0A+FJ1sqkOPl5lYEglUSlNNJw9MqTqnRRCXVJlOC0JJpaZR/CeXMjSiVoImeGFTWSmuTFsAWWcoT8Resk52BrjrQlGXRsF9eRM1WVUFkclGVICSSSEjXKfzgBZuRYp0wEV3wHxU7omujKrRNFs8NeVWF1asQTIrXHMXxAN96SclwbiNSaNyFJRhoTfSJuSw6tckzbdHDMqa4qF7zVQssUp5ahuRGHR51uMt/p8LBx/Bocz+SQEiY0EPVsOjxAPzbrOGRAI9Q4kYZDpcT5jGtUkWUxDifdXobKOeycuDnvNLUuU1pYvYQ4AE56JSstFDKBVOWQBgr2ujhE4igXZ7FIK4WJr+K03VZtrRsjTKAhkuYoWlpvWhORAtcIZ70HZVZdmPaEMn2pc1NmXUsCyv/BQ8JiFUk494UZWJ8VkPLhZrgA5Avt0rYWGjE/EEO8Ny3FlXBzZKt41+XEUXqKEwE6PmdOwl+vcPgcfERnScGOzT3GbeBd5zNrwyUvKadZZ2EAFl5sWrdZ+0GgynyCvUtE8HxqyNSh5xbgDLvhvx4bnV2aBlMTDx9DFlZaOMYx7SWfNBkCAuG/p4ld2GfOEmAP0tm3wB6btt+CfSVM81fKYmVufbRYb40KxyYSiGpsKtXwkgtt68YTO7ZUjs9TO3FWD0w299wzvSpHu+zROM566pCBhBDKOa2UySbd3tUQZnqmDCjavpOUzipOGpvpzR39jY7WXX22E4JRl4lDKFN6lzanU+mt72oT0pEwcQJBQlpbx4RI29I6ybW6o5DfuPR37aaBlmpmndeCCroxxJPgCvoKj8MJRbRtCRKivg91iWgpDANb+g7lQ/u1+apK+6XrA8iP0oUtxLJGTol90XsLm14gFGpLRELDsOzaHCKp0yRHxhIIVBefqWIDDXxYRxe2QImEm5yqZqY9HY1UOG1+acGtROUPSuuIj/GdewgiCKfhLSZUQCoutPTqI3SJUKS0ilkiZRGp1NmlFVSCscsHmrSnaMDp9UyvY76Io1EAhPDKAGcGJJQLn8KzMhUyVa7l0oxWpkJGqxi1iyTUinE0kXa1vZr7xeYeR0Q0u2jjx5Wv1vurivZ2o8WvqIc33xWraLE8hH9xoIlzK5/NtzHrGDbKRh+8FhMDVfHyNGmvajpKQ4mN/cVo0sm1o3Bu9ALfTWZsVXGea5XCZ6qvLSO065xF5qdrH7oDEXp4VMDBqQINGzNU6V4wUbSM/h67TdN3zcalAsJ8IdMf6jEZWdTRFUWv7PVhSMWwMvJrE4ghobj+WnGwzZ5ps87UKwaeXphOmKJYHDINSGjaM2pfmw4ynDQEVxk+xGlkvF9oeruUAIHgbNLDx9n+nLXUUiPqODl40Qkci/pS0zh2JTq5iYt2Sh6JQ5iSdI+lY1NbXAHq2kU0+JzkiqcCRJhPyhdyiSYQDDVhXigDZqv1lqAYFrLl60Iwd+WsnPGYeN5aJjQT2wdFU+NMH3fcwAu9ykfYOdwDtkeFvVhHwfFOETzYYgjZ5Rf9WDkULaiEH792VE3egjCyaUDwUlFh6BtE8muiauq0GN7Jzk5LE2fNnvzZQnKozFZOjdODSFprTElfA2CCdiQO5ryFkZzfBdfkTxGojnPI0xAjaNEC3RxD8xqocKRkpvmuiq17lphtS5sW87JLkHC4qBcyn+1evjASTm+qM+ImHMp3Ngb8sPv6CKwm5q0Q/IQjZofx+PJKY2pL0KvSIgRCoPVcnJRQGfTJibb6s3EuzqhXOB2Ys3HBJvPVSWJeZi7VUK+d9xHyxZo5FlGTNTnPwlUn59lUXh7LEVZEdO5aDPnmbLiarXOT+0jlLa5IN6LlA6Jxm/PagOntNLnBRVUGd5WotNQuRUauY24sx9b7f4hT35tGXf5khKW4QYNNb3H0HadBIjKYD5sbfLB7qYqKrlOISD2XAmUwLecmm2YfaJj5cFutkLa4Kue5zw2uDs8dnOX7Bk3KY51LmnypcOvQa3KSsXaPJHf9BkPJIBTWqzhTOSzHhXvmDK7fFRfOBcgKyxk04aRNaLKjSNtVpLdd69wmtF3XB9DsHZImhGf+wq8pkJueSKOxOlLls2DDfbJkKedERddHw4tHK4+cMNveUSSwcaBV6N6d+Qom0xtfMd37zDdqQovFFfcPAzFRpWbPuA4tedMFgk+eNO//TA+z8+6KnbT857tCWzs0KZ1VqYNIOZtwbPwln4WoTT7LcK8tYn9Nr9OdQorbqh6Sni+L8cjJgNKYVNW1ZEQqmp7F5JfckGWkXBj+VHYDjTutqyaLPTruQwSyOEDaZGFI45+lylaakBx3liZsoHoVMJngOo9lvCIfxI1hD5Dugr6Dbo1X8m7IVVpv4IUJZ2aYfBUYRwwuWTK9U7NGTT4q515wAjVfbZWny0KpJRl5chYPvRzgWiLWp+XjhyIaaY9X6ipSwMn3xIup4pYC0m+4aYKhJbou3GkijdGfiVolrl5T48ZF7G7/nrUuFNULhP9NZtGFuDw4CmSEmAFPiZMwaZ376Bs0dJM8OGDkjNXDLafwbIoZlbQ9LhuNApFRV9zHVJKMGw+K9gyEqyT5Tk5PFJDkqpNIkyfQ0L79IInSdqtKOKqEE4eqKU85eUQEaP5MhYfVeg15LyVk58GpPUlr9CZlfLGaGpNJkbk5yQNi2cjyfCVXL7ondRUVR6u8pVQKD7GHowVaSpNcFx6hamfxZ6pTuNAEKvqs1AlqZOwQEQqtgQookMxCDYe0Z6kE6uR8ej5QgsozUoHKAEEl5SuNWiaKCy++1WUiedAIBtKlKsxxnpX/3jPjMsfU8AFcanjC7S+uj2Z7y8blDoFGSuUr+RhOWhMCaaCh1oRmfWFJyWx3K6wsNVD4lwXqQnFAW6jAMueg8HcsoIT3Y9RkSRO9qnaoPOmv8BoQiK2l6rySp2oeHprP5pInPrZVV2ciLStnzKNIm8qp4ZnyvF3cl84TOa5IXsyTxhYd73JM8ADlqUKOua+U+GpIyFjs84GWvyr6aslnNU78gTrfjQAhNS+uKwRKC/pCcZ4KtEXE3q1Fn4WEG5/p92gkLBAEc4Aq596p7+O62+JWQOZkmmVmCkC+WHFfkqhV+/lShdDILrz0c5dmcmWdVh+0BEJGfYD2iSwLTCA5NIcnfgC850MbEEh+yrHGAzQ7u3cIkjGBllD4wAQ6vuj6LqQv+XwHaPhZB7/M/fiNx1B2ubUICEnuSTpfR1oC0ZiwVyqniCTc1GNq5zAu4g4e7KHJi5Bb1UoSeCZJbsdzO9TiuUlvGCiaXf1V6F5z/c8XCGI+VJwvk+qdMWjIR30qoy8exNBUmGzSVhBp3CGI3ehBHffy9PDoQInrC1nFNffWUE1axgV/iGZocr/SKxcYaiGNGxFhK8iVU3iSnS8QrQutfKAKelh8xl6lEp6cRcOppi+hNmh7DTR9R+JpSi4SJeWt3wPFRf9Ao5PWr7TmixbBSQrejm57OW0I+1Ighi6rKtQyXK1ykVtKoKdTs6SLuArSOkl8lfRVbPtxaSRYWpanaKBY2cg5cb3kYSeBBtdLSoDOzaWwtD4ouEQkxUhmGdgDNaXFRJiEb1FaJU05s4uLlibZ8YWqEDdkVJUklzCllUDhrXgqneQBqlswoCUqoSzPROGYqIkz9y3m1mkg0KggknSVJuakkG7ZdNOnraQkFRYqt0DV13G2UFvnUthXWAjuGbV7XPGhqeFVEmmZjIO7QJTmG0RLBWT6Mly2HuR7QnJf9E2pEPO31IJxrSnMNqfg8Ijbki0moTY2l/uXrvJuBWiYOOpuxmVpp43MXK1a+q1rUHG1lyAzAlG+7m1zRNryNI0bYmGp+I9rW1GnLd/JuFQYggbTa3G5R2JbgJipz3ApW9idUJ/GN1W/ubAYu7KU8ROZGT3IxD8bFclEwP1ACKVS50+u8y8NlLJFBUKXJxC/uQgZzJYLsUv3CrkNOZFsuRgyp6QByppTSh28hQKEFCkT8pwwa52Ppj3BZU6N26Qh0MjZNu6Zho1I1qCJcpwLgQHoTX5HZ4aifiLybS7lhV+/vojLcZITN1d4h65O7HCQnUhxcRdMF1tDSggzTQWQQjYNbCgpAuj35pOwgmqqCPA9n0eJizZGACCiMQVoyjVVL02rpcpXVV5tCoP4VuyKiT/Ylm45gCoS3iXRQWGsDTfkicP+liePQBQRclt8Eg584WIswqouza1qbpwqRDi6dFH5qK9WlSrGqtpc8Y1TYCZYjvpFGT0shRWty9chLrNOyZi0hpMzhjfHuRhc1B8hjIsEX0EiU1jm0rBpZNoY6y/QWuQMECxFV5lFJNhNoCEW1yEZhrRAuZFTJCeX/GHnYQF6QASXCVQVDSBcgTPRS660Tloq8OxM2hYa9UprxBQYbCbhiRgoax8Iw8fsMmllDtQzdOtGohkbu9AkTaWH82mkaQtKlZRGPtUyRJwsFdwLJmU1dpk4NyhaAojb4zq7ZF0pi5z63UmB+q6ZqAqTNKIqJO27icIKu3ciI5t+gmB4HQaiQ0KzdaUNCnBadB2qKYV7AFHl4jS6PLwitGPrjntx0iBJhYcDkCJIkLbHCf4QaXkTa0JyRGykEdShSKIKf6C4e78FiNUwp0SvSiyIsZGSlIJo96Yg9VUiPEwRFAtpUqYFavouTKK5yWNYcTuKxMpUCdzQhCihWuQkpke4QwRqf3ISZKM+W5m+I2fsrk16LYWGCOBAC8rmkBThWB6IVuuQ2U5gk8xXm5xxaz7QAkl0V/9UuVZmLPyOghDyeS0nQkLI7gRWWBVArIZtsd5p+iw09JFGAUYxvXMYrQR8NMiKqxDKKR0wVPag7HBHCDQ5YCQRiQsEcbYhNESwsS4H4wA6OCn+QJVLf5yICihEt6FDx0SKDkS8h7jKFWiJSOPYF3GblMbxS0nhN6DjV7k+q8Su8fGzUcn4kzETK02oO1ZO5hQoIlpjsSFoBCrH1p6JqaPfhNvxya938u3G8ZOMeXLiJGfnoFrUy5WKLHrZpRnpbD3kLh5oDRDf+cy8C8F+JqfkwXc6vWtLqBwGJnyhsstM2EnVbVWlAcjoXihXytRBPtHl4eOiQ75QhoSEvoouZUpjEAg1gvs8NJOBqhpQkiqi+ABVqpJAUAkXs1AxMKqxB0r94JxSOITGdVZOoo6xVDlRTm0iyqnSN3VJHdWH+jI8E4TUvIQiZBksaUwKGYNlLO1tgRralK5YTMFvl2LnBFj6LJhCESPPKIAnfnpCAgPQSFqFryA/oLhcYSlyWMNhks54lk+izYii+wCND8OdXJFBa4qQGGfR1pMJsTC55ZK5bhdpCeSK8Z2CqhRd+ApdVFJTF9XU1l4kx0Wam9cyaQIqLWZvtFRVFpfGuS9QJ60oo4TTIhNVxlIVqINmA6mw7W6oKN26e7aSBs0kXV0KXl90Ry3KI225BJoa1oFA1CVaFd/RKTpeboa/yG8tWyQmcEeguciZUflBhCQaO0UjZL2pqESRwqSR1mZLeaSvVGVJ79zBzpvIW0VnkszJTt+pImJKBa69zzjGhhNokzNXkCo5aY5YT5FIG4jZPFFuxk6rNH3nEY9wH1nuUwF6Rl1KEk2ImGWBrHRlRAbq30G90AwTqky7ieXUopUdCl+SElro3E+NC1Ev1QvShqsfF5rxRa/uRQhZRqY7oCwjg/6etRjn0EJgO/W4CIbFSf24iAtLrxaZEhLDNmUtkPxd8K7JuuqpjBgP3OaVyQnCrJQY0vCIKVna50BEni30iHOeJP3mq2hiWCqoSMTICURz5L6TpbGb5cSTbTRAZvoIWCuAUclD3WRPads0BklC3TFpM/UvKi0cPU/nES+l4MhAILv4rM0vSRH5uC848XHOEvMDYM7aMIWOJSqz9DoG7sLC75iDwv6lxszjHK3p047RSgvR9lq4GtbiYoaBl7bnz8KAb768cDsvXn2YuOOkGeXZWsx3ndCjxbXG9pnhjfJ9KhzaiVWmuLSE59sYrknCr93LuzqcbVcBLTmwrkhWjMzFBeCR4HkS2kYVrp4mZVIagU4zY1VtTSNqIDZzBbCkPvI6J43WFJhvwZQHG6ssgXBmiCQ6Fo5QMP8luFMhiGtYxeOz4wkfKTg7MKQvBQ2NAwYnZtpBrOBMDyR/VzEMd/VcYb2Ze2dMvLG9BGIabub5QQxNwYhIpxaWmxnGMcCyIArWc0/fbEstjKZg2x7sdhXbc4PzFkI2F1cFi3WlXxNGS8+ZjNU4wzQTy0XRGAv+SBmFDpcGisMXRpVgUEsgTViZkEK1phNessE2w/N42rk7yU0o4n3CRadjgQ6HzR5vZNAk22qgSRDtE6X7Fxf5iPHjK3HhJmN17Z805RwKM6ZbbxJop65UXim/gjORFFfcZ0WLVX0n9iT9YndAPCu0OnHy0K2oOy1yWn4qGGczUjcG2C9JGTkZyMP6zQj9LykyFguDJCH3Kmr2laR8nJxy8aalWsmR9U6LnNFepWksKiH2MiHMvzTlZKXLH8dhOQtBRu60n221kq2w3MKDwiPkT9ovE/JaMet0aG9WNGBe+NJ+2SspFGztVWRsWZ7/pP0iilOShijkQIX6zCAFU/rSlLMB6gn+dH12kn66malZ4suejRnUuOx5kn4FH5ZQdw5dm7T+aXOX9Uv7yRnXTn4ZP138O4mJ8KX9jj/3OkFH8JZK+K5+ST+5k8oLAYpxgzqQHbFP0k+3DolTw+3IROibTSCcL+134km8oW/iIs/isP8n7aebe7jQZ+74NZzVJ+hN+8nLjijN9rIjxLXvxGxCPa9ldzyBcgWr1p3HKjduIcJkD3LaO69DckGy9buAoXjR2kOr9tcbQWXcwbE7183eOtMAkgjfXR0M21WmllxuihPSsGdWFffVZ85JTVb994ekCqABkK+kFN/32SBu+ORFTGun8ZkDcVdKS9wMclK9AEXNcreFWN4dd8Uw4qv6pI12Na3SySO76AWa13fdV5RcwviDaGgjrnjHUbPSXZ07SnFZUoimTrpr+KLTnyTGjToTVbxzl6l6EPHoDBecYWe1Kkffb/DDO+vr5q9eqiU1abivKp7+kpbqy9mI194YkMbFp0ZGXzVjntglVZ3X6DyCljeuWDXCujemufNVPhoQ96XKt1KqoiOmMwsbjy7IL75KDazxhsqZTy6O4WDgGuHhI+SR0P6mYXMK1fIsZDp5gTHR3Dtv0qnWT066NAcH3k4l3T0dko3l1pmiDSfdTpVPmnuoz+P4Kyr//hSg4rbDzfMZPOIUTkbmRSfEO0MTKrThewM3DShSyeE0Bo6J3YkFf6rMdPVYdeLLN+brocI0/2hGCYOY9aYyHD6fST881QjC3wm0z1we+a70RwSSVIV7hmF41+y1EzXf0YKdb1Cvxh361OMlGOQXBKtvAcJRKzxusvwalwLj1CvE5c6eyenrw8z6ee59fstjEKq/st4Go+97pmPpO1+UDM4ayJOB4ooHnIEs/o6OLbxKMVi1BU/swUItcC/3ZeW28mCByPOfW5TDnv9VXn8DZdo3OcoZZIFyd3opng1Cebtv1fTswWLlFl+qpmtZgu6HwmMQw42jT+hYrlRO2lbpy/CaGutc4J7uy8oQsGEwhU4Sc21S/0raN+I/fba+qTG9itm/Jw83tG768w/yZ5pDPHpR2Wgmi7/6oi9bS2HC+mWIsnxBmE5gakwPKjv9ZH8tsIm56zXEX3kqHdaW8tW47vvIa19sb5oZeHJ7pynlfrLCM9hbBF25Lv54emHdNMxQ4hSkPnFO+pIHK/SayMv1ltcta/VtgFoDH/IKXIcIL2lAv5gGSTS75GvbcW/5Mv9iqKqXNClc6/B06l7flFyvgiv86avUT3dKvK3xMMe49rjNQyYt+3UP6MNFwxVW9NfVBbXk642QyvshC3ZV/NAIQ1qInnBmwvDy2NcyHV60415IxQ2HLWRYhgeueCE5Z3afk0YbFltNcRuop0M+MBeKQz7QY4XbIe9nfivF3ASEEFs9PAyJV3hola6OcDV9Xyf3i3ttcwbf15kg7mGzX1Xf0Tbj4TL/N3i/r/DSfc2n3AjZonhCmJchW6xhNP/9oaLpcRgFVDzTDTyDBdhrGlxjeXGWP2nIQ+6+dkqji+iGhZRm1kZXsk8v9sPKFrjcJ/3PzDR6a/y7XqHxBSpL9p6LFo9cS7MQr6Yxrq157WvX3ukWvxZT2IeAsJUMjprfqJ7Czcz6vz/1YhF6t2cy+OzgSbQ/QeD0K2ti/UliuBvHroXUf1Z1tXDkDoLbI11v86HmG2anIr+MI6l0bri9oU0MXxAh1F5p/vuT8ycdMdpE1MxYGBR1Jf+HtqFyHWKgAqvooxUevPDo1EVDBLE96CgU6NZH2yyR/fIZSmG/g4bWVMG4eBVN6KKx/CKbFcv135/CflIE0s5ztwDEd7F/TLyD/+T8SXlMa7iwVDDIVL/DlkG83/Xl/OmFMF4d4pIVj18NooHENdKxz/2hxpNvPPL2fSYaPGqUUcXGsAtxZ4MX7DIBTEwkc/mr8Vpc4j5HyL3n0aSbJiUorSan8bJbv95Jq+V+J41bb3Fo0FeUzXtd5dA/FH+67TUuInF20oNd3BLL5BzcIEuNNAAZjciXfQvtUPz5BbV4v8mX1/zUWrnIr30XvVDKhySiNOjz/t/+dxMU9V14R4iPFq8K0T3yFeEOQ8E6MrgIISI8AOe7d9QKPflH8qeLhjwM2Pq5+BfoXEJkIpR/fzL+FLxEbzCdV90E4FQpGzlijPPpIx5uQ3aQv8yXz0k8DfZm1FdD9W3oi1IxxQF53oIajqFycv641CtT9T92fpm0wz+y8JaJQimjSMcOfn3yk4+cVLAD19yEB8bA/yxBIgw4mZDjk2A1f777yW9tHNNSoFGOfU0ebhl+0/9dOev69+e733EarrpfmfG8D28ZHOqOR8zMpOE7M/79+eyX/QRROYpVOOS0u1vOr3k2H6NNSNr6bNw5XyJBstjWRxLm3yE3vDclsjVrve1Nt+jljDOdB4Okgdobh7lmr4c9//0hEtrljKta6FUz9qIut+s/SZGx8DTQxFeMBIGTIGp+vqiSDf+yDrVmav/+5PvJGosNFMtKcxfKeoLte21SyMau9X6kzQib6sTCOroNj5h/+Oy89GljMqZN2/zJ99L4bSq4dMt98zzI8Z7+Un5bfjGThzd5cDNAxPv7r/CT/5Npl+MvHSn9zTTwo+YJiQjPc5H9wXAnPJNHQybc9PXdrhl3bUAZxxF7K4apovqEU7j8Z4/3uD8hpchdGOuQ4szouoNS/rEZyKlcvuNvZX776OubHMkPiMBjOKbgv7UxVhPE4v4mCHR+7+uToVyV3zdhPj9f/D6P3+v/anyv/XP47c3ev7ePcIzwwsVYTsh8HZclN7cMhvSw3FiQr/L+933x2zgh6L4RoW4mF9q2LkKdhG3HY/Xoxrk54Wvsr392uMCfOIA9q5ULL15FTjwPBtkHeeB03XHgPgTEbLOdiSUQpmS37SrPZbsx/+PRUiX8+/PNT7dufAdHHp08kJG5LtN5oyJkGF268RWfScbMpRTlDGFPaf26nuOcg8tMufz7U9ov432tO1uVy1gLhPef7mJ1POm+jD955+mxA/vjxcV1IS6cpck9Nfz4fLut4dR33XRTWJCi+R2ogDJpPX93zNS0Il1MoMYNudWujKFTUdEFJCJUI1Gpt8K/jKR33Ur8e79w6Wbg5OohvxvOUqtwXxFXpsRXff/7Q1HG2LLOjcvCS4qBSgcBuDHKEwDVHj5cv5RkiBO80vjsJakCuMRZuJKaqi9/+pro5tIoNN+c8V3jbYJFzsblz0UJYbRQGvdmuW+77t8YeFu5Lul+BDHGZm7UbjJyEZfLseFBLERhb874LlyL1jhOS5OK7F2PIX7hkVmIdq60fczyuhTMheHB9WGu3A5uxMYFdpns511CVV2WDf8njRvJXHRdvq3cSeukcXE3XNtKOm9AuEXDbzRgzh5+v4G70sM3je1aQAG0zqA75fSDemVR2qYFXI4Ot3chWuC3wd3WMf79+U5U9uJ9CJW3eJYhvNkD+e0I2rMA0H+/+un0SmyE5Ce4ib1QfZmcqAY4oTjiUcfzw28GnO8cGSbZ14oYBzhtdKIvNeI5ENNg+zHwUzY1wQxNFIjuZxSQVvp3h57w7spIYQRDyAg8DtsiL5qbJIdsR4nh6JzfoDRZJ2iFmpnnIfI7zYGlfBwnzSLPIQl9ugQfs0HwA5/A+2xvUBou9L1BLToxoBQgOnNX0RGo3r570yCZj1y2eMjnT9mqCSEaJk11L0wPh8MobdeLnMQZIF9fR1vxdQIVdte91FWWq8iwDcJ1HP2E20IVHQHEAuIdvOOjIY1EcvwjPluOjTSusqvrSPCJat2I39fI1mSoR3BheimKPlFsCgFAJq93FGbMCUthgnzmJ+iJpWHVSGh9lrW+WYb1tY5XVCf+TCH+hwe7NH9HkIrmWUhwJ6rsQSx2NhyUUOvVDZlhg4bDahByIzt2xmmbWpodEWPSC/mKqzG8wAjI4tAZZRwhXyXfE7m4k5eXovrkK+D3dXlj7g76snm8iYLSvDhojSKQ3t/9vok94EFxKl08L47LpYK1MfpEBiHwxfeVauIIbPkLmLE4xmdEGmv9s4I4Let18xu5rd7so1q9thxn5Wp4g+G5OOnC3mgmFWXeVxVGhCA/66J4OEvb7/spmV1myeiknLQOBvgS+X1d2U3Sj8Ukn91gLcsNaG9Iq7cbOpN0/uFWH02VAHP0Z72/0aiyggmJL5ikM6qlJ0AOy6r8WfsuOl80uvs1nzBimRvsdtjIctpe9q3JPMhij5kPDa8cM5d91J2ism+2We/SWBFvjX9fEJrqihBiD/KTGC71DCKTZORvaGq9WUul/i/Fn0LjwFC9ABzN7HCk/cY9e7tuusaOPTfn0dYqhpj7bt8ce9c3QB5vvaiEfa0jf0dvTVbAbO0Nz3ZXk1UFk8sXTy3bPeSogOtqj5njZPeuyS0wEVGcHvt+9ZcjP03HcCwX/eEFzaNEnjLN8aLMAO+x/+irtOXYVeRs9Y1ylU9QsoHv6syOVrWPGlw1oQFnUVEVz95tX9lTwu+LhlTdDQ7y57YiOVQ3z9uaJ9GZKfXfHypXG9pwtCd42exXPWU9eSd36+aBBJCspolMxhY72ctaG//+lKCJOv2cFbGfHDRyvj7Ei+vimmJ4EdaLteVuPnSD4se99sX1kveF6UfBaMEighMBqt6KsH7qG5ozy7932SXvnTiWw6ZlpnXFoLKcOrfl2371Oux3svVb2F3mEw4g9pZNTegutk53pDuZ4cBre3oPIskxQfGw/khgkEFaa9c0sWBKpSY73pHc8Njul4g3vdjZ2l96Ik4kLzoDCeDYesa+w3PRNcVFOUntHReH89NnJ4bYiURKgxHq6k29mj+Mmy/6K4xkk744QhyNLJZ69i2PeRjKdhVZTx49BBg6YMElPUAW1Na5mqGP6MTTsq+j5mkKwHUqb+DGN8k96qOCQ8vl9o3QS099WH1A8qKqjhn6hm/zYWklxwyle7MRzX9piKKZoFtczIbW9Z2D7XmxHya41yUhOFimTykLBtk9Sd8SVJ7jVcJAmG8D3rJgBAOp3/xxmH+Yw3t3eYn8ChHPF2/ifGneohyBblrqtNzkOHlIlj7CvENwL1xLWKs4DjCl13kPVvEpj9K992zf4BnXmc8NIumrNE2wIFvuAH6s5FX3nzF3YNX9TQ7zdPPY/+PNrpe5yFU0XO4rmdHxJjivWd7NRz3GnkVtXkf8te5gi+kP03tJ/r5Ihb5oxSY0XNp0cFRz7XwJ8ybpjfQj8vvCPnrgziF1Xy1djjiIGLu8hP124b5iBU4HP/Qx1VES9yVwfYX93vp3NiQHo2Rg3OqGuOXNlhF8P6Ly9X168o34mFu/aOTiz9gms5vJXngafaiI5mEZ517PB1q+W+ZgsY6XiRC70k3/9KN3CdbpCaFbHFrTpf0Kz/id2NBZNxwVG5pAm46r6BtG24GFHfLzfCcqDr2LHTs5drcb7jjP1MQTiNPNHvmSQN264SifRq6KJTjHDT2HQ9q679inX1XUs+YRfZ7HUE783kgDlCsKoxnN95la1/Mbjrqg0fXMK/9xmHL01lQcAzj7EtnZV24aorjKFd82wT0UaJGHWPS0J31phrQdBZMCHGESPi1WWXRD+LBRjJBHtigotj057tJ/X9TKSZhXxxEfeDIks3ucBLLHtZR/f777+UJjIK7glStmbvahY+3zlIyGFfp9XjFzT886mmZ2exgeh4vOd7zZ4caNl/EUXWo6TAmfnrXOWzWnkr/CnbovNHFx0ORxLmAK7Kv+vkiZOTQt30P0pnPu/NHnPAnkcZy+/skePikuswR9qdPRTFddVyU9G75qqpdJyr636YD53M0863/9IUmlHTnYb+/ka0blswrmuSZ6TqBXaXIB4CEQB+havBbkkGKrn/d7lERGYvvosVPCKGeU2htfpcxr8hvvJ6HGa0Gg7pwqIVS4gQjMwxtDce5TKB5eyyTAWOdl0YZjhB5bKkTMSNJL6RkSVWVQzcbvST7qyEdzENuHFMDgxRP7iflVExAPnvR5dcFB7rmEgwTvrMYWpLT+B50+lnMD3RoSTSDe+oyzuOK9lfPWp9LKeZ9J3/m1pvLvD5Wg2enIUPvJpYHnQ+U+0Xj2JZQcgRKoKa0ybrown/9zRuIdhSv39qX4LB/5jZta5jq3BhFXC37jTOE3pIojGrXzHJTqCKpExHtrrPrX+k6nrMl4ZkKWbmcTa/tG5KyelBXExOuU0Jy2/v0pQeWNu2K8PjX8lZ+womxmmgvj8ayBu0nv7Uryi62M6Uudprnrxl2Nte4qLqeNd23kdzkw3B8V0fTrPXRzZ5LGVWp1XgUB/HBtJyOvA7mWL5Hflzacc467F9y6kyYAQbLhc9N5GTgW9R+CQX7wbK2M11gwNt5pQvdoT49TvzqZ4R3mOTgafRTljlO9jAjsNLw4Gt41AkWRnDItm93hHMlYiUzFfFVkRN7+3dytV2gqNTs2Xoef2oSsFFLFQnOvnPm85asgVpRXiYu1eeeXtu79lZd51rScGJEbJjodkwt+EiedQMOvBfOdm+5rrqydSSyyiCaxiQeROUZ+nGfxRtNYxAPbF3MJZYSficvcoVdVBmi8HcF5QEgNmkadUGS5Xs1znVsmI7VkKQ0DlTa8rljug5oMgowNunawegYzXRG1UAtfqNG1+H+N7g4T8JjjhjaYwpodXxpj0FiC0xParBMeGAooVdPrDD5BDM8+/yK6ltF615KbwPoBMDyh7c4ovT+WPhhIM88wnwhR6douKpPpbg4zvBHB3Bav7nndLR6W7nARPxvez23pcX+31sXkw+b98UG/jR1Wz8xp8fAAoqOLs2rRFLePZZLZj4e95qofHyQA67uadY97rIvLbM+BxBIq69qY4pk+1RP0fhccYsEKtUxwSTwzvEi6OnPnzhnfnae5I2WbeagB7hTzlQUTnkSQ9bNpztheAsuDOikoz6vREfhM3UNs3OH9EeQ5RLTa5ZwGZCS43kZsktdm8btuA/fD7RcdAW2dxV8UR+FLcXt/CnT3PhepSHfwgSQvprOCB4CFnxwfj8Hc40TL23YCvUn+Plv5Qrdkw/ayiZ0j0j4eCe192uM1ei+bEV8qv9dkbeuWHz+xnQpZettHH6Xdtu7bb105RoZfHLG+2xR/x267b0PUtsWt846WzX2ZN7yO2Z9Xtcp7p8D2vFM929q/F7xeW++2/pJ8x4azeX/AFHgu+yrVvgDVpdpGZNRfg22Em/13U/x9RpW15vvV+m+3y3Nil3yZoJabv7/naW4i1BgiVkxnd1R+DWD7xBEZvJiW7DjQy53W29f3p3f2bVPzUH7FYcLxuXtclrllO6Afnak2M85zWHztyKu5Jj6T+ZoGSeMy8y4bQ1yajQT5Pde9VbY5b7Zb0fVV8nJv2Lb0+P0em8rcNtvs/Mrbvux5p5tRYRwT9vsw1muO2vY+eAt7e2ufQC6y0uGFW9hZlDZfKvvfn28wbzG86TbJ7P2ZgyNnf010W0HjlcZ7Q7aLotX02pociU87mXhnZfgNI9flLf13bDkL1dw8R2dI/On8cdtrdr7M435+ZVmlbXq/o5gmSNtR+X590/c1jW052TaBTNJy/fTG+zbNmT199H9fPWAUVgBv29hQLG4T9ENq+zZnbBsOsOesY1Tx+q3/7gKwEJVXG5J524B4OSJJP9pQZY3Hvs3la9+G6H2sZ+uupr8zr7PmCjOerRaL5n11+X1pm2W5zrofl6n7cIFdP851hsBGOO8s1kaf3mQQ0L5um0Xe4lDKl2uB6ZG3l6mvti/2aguKJ+UyI66XTWm7YsxELw/UcrvVP80Zl2VuW03evrW9/OqdU3b+CH4VxhBsVRKTyA5hy48oMRnYEE6f1z8Lol9d7sJYs9OPDL30f58K3dPLaux9nlBylf901pyXgcmPWa/V7y6Z1yguM4V2PzLkme6vPKSlXdzPtrpl+5xn7LyNVKvfj1qt3i6DwyqXCn21/e9PU9VwsuXLgLRsgTmbw74sQSen94rLcrZgwoceav1bN5hQU1pCOl18EHU/4cY+dncMEdbVt/rHEnE7E54H+/qtV5/t0/6vS/dvh5btlzr7/TqWH11LtvNxU80moWTVb355Kyp2SwiF21V+DjVr59MDpZTtleWnpWolpx+ayvd3TtpvV23F+T4ZCcyplpGG5VXv/3g3K7y69303b+lt748XvXaHQ9O8aNqU8e3oqBm0RvsJSqfSx7+7H9QpZuX50qK/yM/L7ROH7nv3LiFVWk1/ZLb5WTK2n3c75FXWsORy5Vvc10sWjIyqbRVU/uUoNwnU8q88XXSn6Wty9lO1VN4Rqvwk/dnpCctX1/2ZNyw/V78+SSjOne2VEF7bx8ZuYf395q5jOrwhqMAz8vnVxj0+NkP5vUFbxOrHuV4T1R7lWggbjxYzPE+VIwL4FbxynVFCKvuk4+0Jl+v1kp7FID9AuudtedzjtiFuhF6bvbT1fh3gqbPX1+y3Uwsd7i3bFpL6kiy8D/G+u+iTFPTpheWvjqz5754EmmJ/rDG2eXmWIuQu8xD42vKzauUT53mO5YjiReeexRMdSmuHYd+l/T5r1f4m7bKpyt/MfJnJvFi8G+zbtrfNF0zv93XhwpqW874raAHMK3+/h493Ap8kV9fdm+73Ik+tPIHh0bIWf4YrDIK5/El7K8aCRJhPXmgWzPmuwjlZZ/yuBu1iT34VG/7xJvX3kcmtNxbPGiIwsWNonnNpNHW/5+bCo2pbY36G46V51p45paWji/Nsv8nnVWkecnivA5+eZv8cb/QbbnfePnZQ5rSfAMyv5OymEjLyTuv3EPutzcMsKcCMefyxP+5/f2ryczjYI7+8j3nu3k7o1qutVlS4gH0/lGqrn996/Wj+9BJivpZYOUwAa6EfVcZY6MO0M5pXH5LXq7PFbgusljLGqxwI+tezrMVSkDOez8b13qlJvs0xK+lX2TZ3nn629sFvoVo6s3XYo+U4uCht/BKry/MafL8jhC2//YLquLor35ZjCy71erz1POxqxpVccPsyFsuFftvyfgC2WgYl+O83Tho1C7kQqUfP8Y3hu45cwPbrlmO9Mk1RvJVvVSmS5JaR3pF6j97qWy1c248ry4vbvWIZrGkvibJerVRR8PCrLsno6y6vxuLNvr3BI76Xius5uxCH+G25+sH97JxnyRGlwXIlA1cPC+/3w7sY06v1Pdsl0NM4eVQ/vYw/QPNT4o57/JauSAqjfhIEgSyjDYSueGXAoldgP8mhejITSMEULWM075NMyjfte8H0lYi8wHF1qd7zPafWxbDqtaCbV6YDRJjnseD6n6S3YWqmFU+Q6Bf/a/kWI1u6mWid62ID1SqY7VAe9e7iP1tjT/NaYkf3C5VTEwX58KEEXmIZ4sQN6dc+HJeyj4ah8Jjdu+I+InGFHWX9rr6pvovOj1tPBAbQi0gZzfridnklRbecc57HIBYPU0FN7zmV3I69YB9byNQt8oJJdeqe81sBTB+kdExvgzRMY7vt1+qYFTP2MtLZ7lf9nQ14//6QDOtGzbbfyVIRt5+iJUNP6ekSdtExOBNZWu3neRxU/LHKMnwiUCPOAc1ZPMFnW6xeKoi9mY5z3APM9yu9ARaUZkSl1zpv+nhcMqek7ccDyjE32OBaqjvzqnQ4g2Xiqm8CIah57SKCHckG3UJ7JuaRr49kaT7mXR4O/APOcO8rya8I2mqKIazsy15sQ1hoSjPvcWuW1NsQxutFX9GqCAZPvX2BL0Cg7O9Uk0WQ5HA92hiRRIVuxjhVPHmxaxe8Phad/pWg8lgNspsWBdg7luWg8hpKtdsf2+79lWgsm4SpiS3s2NsLJinb4ssqV4e5UzCGfUREEpvc9hAzo7Y7jLm3MdEVjFRx8MkESLqRv5vXiAfP/VOCyvP68bSxmb7TBBv0/aikXXSYRd93imLtIfHDlF4/rKaTxro7aVt1qUxhD1elJxitSlUWZrzqBdoaJI36vz+Fy8AJK9q4TtiA6A60C5jn2EHltmVuWygx9W5e75xU0x04PY+Y7x4F2jpo3abHbNHf2IQ7zlBxwI1KY3Xe9GbDc2nDjRomxg3/aR5L3gZrcDE9a1MUCWb7ZRb2AS0ad8u4EQw1NIOKM+5+py59nb1ApZOTiduwhy+meKNzF++bNRyUQoWeFZNKIP9JgiTsaFUeMWWUh58tFT39riZOSnMVYeXmAEwNVjXm7cpILbrHvh3zz2LtzrjfTSReRngN2tXuB26ULbpYvruN/LSj7/l6nOChIKNzu5CddEYzC+G918uLBWv2t8js1Tfh8MOGfL8Taw5vi7odUOB7Y5bX9+bL6bdny+fiwp5zWfZPXRqzvp8tXRZ8AEvAXiZ+Ms4GcoZjjbtw+1pM1oCZ2y6XOX/B+BYT2yNs3561bc8/61buDfZMgH6198v8g6jI7ZlwPhIfYPp7ci6zHX6Xa/NdniRMzg1ncY9vb9r0+PbGSVu2JSPa+ZWmsi0I4I5Q6rXWdskXbzxdMPvVBWvWq4BlT4iyLw67vRwYm7c4OTmY6RT8E3A4Yvra7WoT4SWl/O4mVcr37SekqqxAm6r/IfnTo87tZb4K332YRZXTqoQjXmP2Xswby4cBNacdIopK46okQs/sj4NXXa/dMGsFm6lv9xGm+XTtTeU3ERmIuzkRT1+QSIlIT4RzqgT2kdZuE7Ny0nNVHUIMkE3o/0lXEax1kqVFlj7IovzNKStA7EEvpSQQk54AHpESkZQR0qnXwLetSugcsj4EiNiE2qk3rwV+2URaErsD0YapJH5HCEyZOgNEwD8tT8dsldY4QITGRKyuPLmr0/SuPLUqrVqAoR4rqozebf1PBYbP09TbGpsHCKdUdUoZAfyBfqv08FKbip6xCXjMeyQBIgqlnh5UG6PAM5IRr0yhjzSS8989xr/JjCLw8dTtpAARgDKiusZv1cVdFKHbEGiqbu1PXJWJOT11Gy8AnxdaWfX9NCgBGLHwAJm6Yxkggqxdlfkt3bfYEX8/HhF2X0YYtNPjEXZ44t6lSPPzP+jqKSm4VdWN2ikpVyn6wqQiQqD2SRWi3+rlqhZvurxCmFbqGSQYU+XJMzgKLzG8FQu5cclKFEBPKH9tUcNUgbi5NWUM2CzQiR8bUeGnNJwBEgQAVdn2OARuar+l91dETSmMU9LvCuVQgz4HJ74P0+N/rEo9pv78JtfgQeZD60fIcJWvFJff9A2rPwLIcLdIKUtluprxu+3v+9AyBShKoQcjnP6UtlZA2Zi0bUGACiQ9HM2gdzoaphE3g5f0yCpHlYFy1gTq5SLmyRHK/NPOkNgIRiOgl6thXxFbd3G0qhLz7u746ULqjidDlElfSLdGCLmqsxUxmQMoYZCgqXG+/hE4fVfe1q40XvYWzh5V18vW4cpF73mHyjNS9v6qGA8vLb1Uvnl2Majpt+r+lvJbiMUVk8lZijLZIYlWbjbp4mqAUJ/gz88LjjeBH2EbtP6VAMtqADihGtzob4Vh0a32AHr1u7EAw691yX9fKf+4yKrf8clbyi9j/o/ycXSPzVUtwJeV+Zd4LnmxnSQ8ohmnhC/7akZkfEmGTJJQJGyEi+SjAuJcgkckO6EmOqnjAgtjSbg9L9ZFwh875Il6XjMWcXQyPrGgrfFuXgYl+UiUHZBy+x3Ou4K/T3uyt3UirmC/K2/tCYKwj2PJ5+Bpj91xanKTVAE+GbomPnJ1q2cowLEt35z6zn3MqTHN8fYVlj711bjTOC1kuPVByPkb1VT20bAb0QTOAN5Xk53/YVKJl6gz09F1+Wr2s76m6g7AKYB1E4jf+W3ql6946CEIR3bJHcDx6aWuoqh9s/LMB9R66Wp2sVanXCfuYtmU48ZLBK0ES768KjC/KHuSYmBzObJcttajmDvUVy3lNUScvo1n703/1QTVo2lwaRbQj4hxlB7OWf+kfdqses6hZloMYWFaLGtjkpE1NfMIetLUIB1y7rHkYV3WW0spXFhhHCErJzVrCKq1RNkn9n0NR0Npu32a5/DnafeS1Alm37POStbtc1A17+CYcr7jHISUv31GYipw/rYnts9+3J/YHNw2cvz2EektO84G3ey/IvEnr7CmU4SZdjUiDc/sBttNPFfeqnlh5pzCdw2UvA98Zxg2j8yjTEJkHO8cquiuiJYsRKWLfMurmWYXyWr+vfnO7HXwjnq5CqhefmpO9eLmwFTNWirvsnsf44hUfVpbk+/MfamXeWWn7PJxXOS7bQov/+cZMjVFBRcOD4mInuXsBqpvmFYv5C4YqkaeHjcOm4te5ZyY3GgamjwN6ZCzQ0xyokfZ/s4au6oS0vjUmseBX9ouGNjRMlK/owaGV98n3fIePdk2RJKJ3salhN5HeTivs/RRXpxjqRcBR1ZUOueMzxaxra7qVjBYlT2uixA+/y+u6yw0wVZarOZbEuNTqG1bYnzItxbkIBshUBtYC8I4u6cXYVzT0Tz5csR+tSdVj+2KynUBQi83VxlMvyN/dluV8RiSGvMBramTfKhntA5iqeblNCYjUsFiXR31fmf2fR3reWrDDK/NfdqGeqslqhtTWR/uSSZtS18vf4j4uK2+quqqIHLH6lD1hMWnc/HFx50dVrddS64X7+3r0m3oCe6KgpiI31WRyQTUJx8T/F08w+0xPzHiGOSlrLDFh2RF3jbJWl/B8aYoDU8c/5qE9aPGabI2uReaLN3S6QwhWKACOjddAf5DRBoezjaJXhgW0GGPwxyXeTK82zMEA9VHorzRb9b50VQJ5j5Mm2HRhWkzOIO4sdbNbmuNuncsSrd6fRG/+KX5y0196tNOrsqiQ5Fybg7musLK05KckQTmnfQSCZLx3HIcp2OGNZ13Ak2hBHMNI3+ktcHJXVS+74LK4rAZ7QpUfcZQ6YtdKk4cD9ooVuJg8ue7/wHswRyLAdIAAA==";
+    (async () => {
+      // Decode the gzipped rings: bytes -> gunzip -> "lat,lng,...;..."
+      const bytes = Uint8Array.from(atob(INDIA_MASK_DATA), (c) => c.charCodeAt(0));
+      const text = await new Response(
+        new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))
+      ).text();
+      const holes = text.split(";").map((ring) => {
+        const flat = ring.split(",").map(Number);
+        const pts = [];
+        for (let i = 0; i < flat.length; i += 2) pts.push([flat[i], flat[i + 1]]);
+        return pts;
+      });
+      map.createPane("indiaMask");
+      const maskPane = map.getPane("indiaMask");
+      maskPane.style.zIndex = "350";   // tiles 200 < mask 350 < dots 400
+      // Scale together with the tiles during zoom animations, so the
+      // mask never sits still while the map stretches mid-flight.
+      maskPane.classList.add("leaflet-zoom-animated");
+      L.polygon([[84, -180], [84, 180], [-84, 180], [-84, -180], ...holes], {
+        pane: "indiaMask", interactive: false,
+        stroke: false, fillColor: "#d7e3f0", fillOpacity: 1,
+      }).addTo(map);
+      // India's border line on top of the mask fill.
+      L.polygon(holes, {
+        pane: "indiaMask", interactive: false, fill: false,
+        stroke: true, color: "#5c748c", weight: 1.5, opacity: 0.9,
+      }).addTo(map);
+    })();
+
+    // The pane that holds every dot (orange + blue) as SVG shapes.
+    // Used to hide the dots during the search fly-to (see below).
+    const overlayPane = map.getPanes().overlayPane;
+
+    // Leaflet's zoom animation stretches the SVG vector pane with the
+    // map. When a zoom or flight ends this is normally reset — but if
+    // anything interrupts an animation, the stretch can STICK, and then
+    // every dot renders giant until the next full pan. This guard runs
+    // whenever the view settles: if a leftover animation transform
+    // (anything containing a scale) is found on the vector container,
+    // force the renderer back to its true state and redraw every dot at
+    // its real size.
+    function resetVectorPane() {
+      const svg = overlayPane.querySelector("svg");
+      if (svg && (svg.style.transform || "").includes("scale") && map._renderer) {
+        map._renderer._update();                    // reposition SVG: no scale left
+        dataLayer.eachLayer((m) => m.redraw());     // redraw dots true-size
+        nearbyLayer.eachLayer((m) => m.redraw());
+      }
+    }
+    map.on("zoomend", resetVectorPane);
+    map.on("moveend", resetVectorPane);
+
+    // ------------------------------------------------------------------
+    // 2. OpenStreetMap tiles — the actual map images Leaflet displays,
+    //    loaded directly from OpenStreetMap.
+    // ------------------------------------------------------------------
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+      keepBuffer: 6,           // keep extra rows of tiles around the view,
+                               // so they're already there when you pan/zoom
+      updateWhenIdle: false,   // load tiles continuously instead of waiting
+                               // until movement stops — feels much snappier
+    }).addTo(map);
+
+    // Every marker we add is remembered here so "Clear markers" can remove them all.
+    const markers = [];
+
+    // ------------------------------------------------------------------
+    // 2c. "My data" — orange dots from data.csv, a file that travels
+    //     with the app itself. Our backend (see /api/my-data in app.py)
+    //     reads that file and hands us a list of points. The button
+    //     below flips between showing and hiding the dots.
+    // ------------------------------------------------------------------
+    const dataLayer = L.layerGroup().addTo(map);   // holds the orange
+                                                    // healthcare-facility dots
+    const nearbyLayer = L.layerGroup().addTo(map);  // blue dots: the ranked
+                                                    // best nearby facilities
+    const dataStatus = document.getElementById("data-status");
+    const dataToggleBtn = document.getElementById("data-clear-btn");
+
+    let myPoints = [];         // the points from data.csv (kept so we can redraw)
+    let dataVisible = false;   // are the dots on the map right now?
+
+    // Draw the dots (or remove them), and update the button + status text.
+    function setDataVisible(visible) {
+      dataVisible = visible;
+      dataLayer.clearLayers();
+      if (visible) {
+        for (const p of myPoints) {
+          const label = p.type ? `${p.name} (${p.type})` : p.name;
+          L.circleMarker([p.lat, p.lng], {
+            radius: 7,
+            color: "#fff",
+            weight: 1,
+            fillColor: "#f77f00",   // orange, so it stands out from the map
+            fillOpacity: 0.95,
+          })
+            .bindTooltip(label)             // hover for name + type
+            .addTo(dataLayer);
+        }
+      }
+      // The button label flips along with the state.
+      dataToggleBtn.textContent =
+        visible ? "Hide healthcare facilities" : "Show healthcare facilities";
+      // Status text under the button (only meaningful once data is loaded).
+      if (!myPoints.length) {
+        dataStatus.textContent = visible
+          ? "No points in data.csv yet — see data-template.csv for the format."
+          : "";
+      } else {
+        dataStatus.textContent =
+          `${myPoints.length.toLocaleString()} healthcare ` +
+          `facilit${myPoints.length === 1 ? "y" : "ies"} from data.csv` +
+          (visible ? " shown." : " hidden.");
+      }
+    }
+
+    // Clicking the button just flips the state.
+    dataToggleBtn.addEventListener("click", () => setDataVisible(!dataVisible));
+
+    // Load the points once when the page opens, but keep them HIDDEN by
+    // default — with thousands of dots the map reads better starting
+    // clean, and one click on "Show healthcare facilities" brings them in.
+    dataStatus.textContent = "Loading data.csv…";
+    fetch("/api/my-data")
+      .then((response) => response.json())
+      .then((points) => {
+        myPoints = points;
+        setDataVisible(false);
+      })
+      .catch(() => {
+        dataStatus.textContent = "Could not load data.csv.";
+      });
+
+    // ------------------------------------------------------------------
+    // 2. Small helpers
+    // ------------------------------------------------------------------
+
+    // Escape text before putting it into HTML (protects against weird input).
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;         // browsers escape the text for us
+      return div.innerHTML;
+    }
+
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    let submitSeq = 0;   // counts submissions; stale background results are ignored
+    let pendingCoords = null;   // coordinates attached by clicking a "Did
+                                // you mean" suggestion; used once, then cleared
+
+    function showStatus(message, isError) {
+      statusEl.textContent = message;
+      statusEl.className = isError ? "error" : "";
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Form submission: ask the backend for location + matching issue.
+    // ------------------------------------------------------------------
+    document.getElementById("issue-form").addEventListener("submit", async (event) => {
+      // Stop the browser from reloading the page — we handle it with JS.
+      event.preventDefault();
+      submitSeq += 1;   // mark this submission; background results from
+                        // an earlier one are ignored (see /api/suggest-variant)
+
+      const address = document.getElementById("address").value.trim();
+      const issue = document.getElementById("issue").value.trim();
+
+      // Both boxes must be filled in.
+      if (!address || !issue) {
+        showStatus("Please type both an address and an issue.", true);
+        return;
+      }
+
+      // Show progress and disable the button while we wait for the backend.
+      const submitBtn = document.getElementById("submit-btn");
+      submitBtn.disabled = true;
+      showStatus("Searching…", false);
+
+      try {
+        // Call our Flask backend (see app.py, POST /api/submit).
+        // If a "Did you mean" suggestion was clicked, its coordinates
+        // travel along so the backend can skip geocoding entirely — the
+        // geocoder usually can't resolve facility names, but we already
+        // know exactly where they are.
+        const extra = pendingCoords
+          ? { lat: pendingCoords.lat, lng: pendingCoords.lng } : {};
+        pendingCoords = null;   // one-shot: only the click that set it uses it
+        const response = await fetch("/api/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign({ address: address, issue: issue }, extra)),
+        });
+        const data = await response.json();
+
+        // If the backend returned an error (e.g. address not found), show it.
+        if (!response.ok) {
+          showStatus(data.error || "Something went wrong. Please try again.", true);
+
+          // "Did you mean …?" — clickable fixes for mistyped addresses,
+          // matched instantly against every location name in data.csv.
+          // Each button fills the address box and resubmits the form.
+          let hint = null;   // the "Did you mean:" box, created on first use
+          const addSuggestion = (suggestion) => {
+            const text = suggestion.text;
+            if (!hint) {
+              hint = document.createElement("div");
+              hint.style.marginTop = "8px";
+              hint.textContent = "Did you mean:";
+              statusEl.appendChild(hint);
+            }
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = text;          // textContent keeps it safe
+            btn.style.margin = "4px 6px 0 0";
+            btn.addEventListener("click", () => {
+              // Every suggestion carries the place's own coordinates
+              // (from data.csv, or from the geocoder for deletion fixes),
+              // so clicking jumps straight there — no geocoding of a
+              // name the geocoder may not know.
+              pendingCoords = { lat: suggestion.lat, lng: suggestion.lng };
+              document.getElementById("address").value = text;
+              document.getElementById("issue-form").requestSubmit();
+            });
+            hint.appendChild(btn);
+          };
+          (data.did_you_mean || []).forEach(addSuggestion);
+
+          // In the background, ask the backend to try harder fixes:
+          // deleting one letter at a time against the geocoder finds
+          // real places that aren't in data.csv ("Chhartapur" ->
+          // "Chhatapur"). Each attempt is one geocode (~1.2 s), so it
+          // takes a few seconds — we don't hold up the page for it; the
+          // button simply joins the list when it arrives.
+          const seq = submitSeq;
+          fetch("/api/suggest-variant", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ address: address }),
+          })
+            .then((r) => r.json())
+            .then((res) => {
+              if (seq !== submitSeq) return;        // a newer search started
+              if (res && res.suggestion) addSuggestion(res.suggestion);
+            })
+            .catch(() => {});   // silent: the instant suggestions remain
+          return;
+        }
+
+        showStatus("", false);
+
+        // ---- Success: fly the map smoothly to the geocoded location ----
+        // During the flight, Leaflet stretches the vector pane with the
+        // zoom animation, which makes every dot balloon to a giant size
+        // mid-flight (from a zoom-5 view to zoom 12 that's a ~100x
+        // stretch). Hide the dots while flying, then fade them back in
+        // at their true size once the map settles.
+        overlayPane.classList.add("dots-hidden");
+        map.flyTo([data.lat, data.lng], 12, { duration: 1.5 });
+        map.once("zoomend", () => overlayPane.classList.remove("dots-hidden"));
+        // Safety net: never leave the dots hidden, even if the map was
+        // already at zoom 12 and no zoom animation ever ran.
+        setTimeout(() => overlayPane.classList.remove("dots-hidden"), 2000);
+
+        // ---- Add a marker (previous markers stay on the map) ----
+        const popupHtml =
+          `<strong>${escapeHtml(data.display_name)}</strong><br>${escapeHtml(data.issue_statement)}`;
+        const marker = L.marker([data.lat, data.lng]).addTo(map)
+          .bindPopup(popupHtml)
+          .openPopup();
+        markers.push(marker);
+
+        // ---- Draw the recommended facilities as blue dots ----
+        // The backend picked these with urgency-based rules: which
+        // facilities, and how many, depends on how urgent the case is.
+        nearbyLayer.clearLayers();   // only keep the newest submission's ones
+        (data.recommendations || []).forEach((f, i) => {
+          L.circleMarker([f.lat, f.lng], {
+            radius: 9,
+            color: "#fff",
+            weight: 2,
+            fillColor: "#1976d2",   // blue, distinct from the orange facility dots
+            fillOpacity: 0.95,
+          })
+            .bindTooltip(`#${i + 1} ${f.name}${f.type ? ` (${f.type})` : ""} — ${f.distance_km} km`)
+            .addTo(nearbyLayer);
+        });
+
+        // ---- Pop the recommendation cards up over the map ----
+        renderRecCards(data);
+
+        // ---- Repeat the result (and the recommendations) in the panel ----
+        resultEl.style.display = "block";
+        const recs = data.recommendations || [];
+        resultEl.innerHTML =
+          `<h3>${escapeHtml(data.display_name)}</h3>` +
+          `<div>${escapeHtml(data.issue_statement)}</div>` +
+          (data.ai && data.ai.patient_summary
+            ? `<div class="ai-read"><strong>AI read:</strong> ${escapeHtml(data.ai.patient_summary)}` +
+              (data.ai.urgency ? ` · <em>${escapeHtml(data.ai.urgency)}</em>` : "") + `</div>`
+            : "") +
+          (recs.length
+            ? "<h3>Recommended facilities</h3><ol>" +
+              recs.map((f) =>
+                `<li>${escapeHtml(f.name)}${f.type ? ` (${escapeHtml(f.type)})` : ""} — ${f.distance_km} km` +
+                 (f.matched && f.matched.length
+                   ? `<div class="matched">✓ ${f.matched.map(escapeHtml).join(", ")}</div>`
+                   : "") +
+                 `</li>`).join("") +
+              "</ol>"
+            : "<div class=\"muted\">No facilities found within the search radius.</div>") +
+          (data.sql_error && !/No issues table connected|No table configured|ISSUE_CATALOG/.test(data.sql_error)
+            ? `<div class="muted">${escapeHtml(data.sql_error)}</div>` : "") +
+          (data.save_error && data.save_error !== data.sql_error
+            ? `<div class="muted">${escapeHtml(data.save_error)}</div>` : "");
+      } catch (err) {
+        // Network or unexpected error.
+        showStatus("Could not reach the server. Please try again.", true);
+      } finally {
+        submitBtn.disabled = false;   // re-enable the Submit button
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // 4. Recommendation cards: the popup stack over the map. The backend
+    //    already wrote the "why" text for each card (f.reason); this
+    //    just renders facility + scores + contacts + that reason, with
+    //    a header stating the urgency and the search radius used.
+    // ------------------------------------------------------------------
+    const recCardsEl = document.getElementById("rec-cards");
+    // Scrolling inside the cards must scroll the cards, not the map: this
+    // stack sits inside the map container, so without this Leaflet grabs
+    // every wheel / touch event and zooms or drags the map instead.
+    recCardsEl.addEventListener("wheel", (e) => e.stopPropagation());
+    recCardsEl.addEventListener("touchmove", (e) => e.stopPropagation());
+    const pct = (v) => (v === null || v === undefined) ? "?" : `${Math.round(v * 100)}%`;
+
+    function closeRecCards() { recCardsEl.innerHTML = ""; }
+
+    function recCardHtml(f) {
+      let url = f.website || "";
+      if (url && !/^https?:/i.test(url)) url = "https://" + url;
+      return `<div class="rec-card">` +
+        `<h4>${escapeHtml(f.name)}</h4>` +
+        `<div class="muted">${f.type ? `${escapeHtml(f.type)} · ` : ""}${escapeHtml(f.city || "")} — ${f.distance_km} km away</div>` +
+        (f.address ? `<div class="muted addr">📍 ${escapeHtml(f.address)}</div>` : "") +
+        (f.matched && f.matched.length
+          ? `<div class="chips">${f.matched.map((m) => `<span class="chip">✓ ${escapeHtml(m)}</span>`).join("")}</div>`
+          : "") +
+        `<div class="scores">Exists: <strong>${pct(f.existence_confidence)}</strong> · ` +
+          `Quality: <strong>${pct(f.quality_score)}</strong></div>` +
+        ((f.phone || f.email || url)
+          ? `<div class="contact">` +
+            (f.phone ? `<a href="tel:${escapeHtml(f.phone)}">📞 ${escapeHtml(f.phone)}</a>` : "") +
+            (f.email ? `<a href="mailto:${escapeHtml(f.email)}">✉ ${escapeHtml(f.email)}</a>` : "") +
+            (url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">🌐 website</a>` : "") +
+            `</div>`
+          : "") +
+        `<div class="reason">${escapeHtml(f.reason)}</div>` +
+        (f.explain
+          ? `<details class="explain"><summary>How these scores were computed</summary>` +
+            `<div class="explain-body">` +
+            (f.explain.existence
+              ? `<p><strong>Exists:</strong> ${escapeHtml(f.explain.existence)}</p>` : "") +
+            (f.explain.quality
+              ? `<p><strong>Quality:</strong> ${escapeHtml(f.explain.quality)}</p>` : "") +
+            (f.explain.procedures && f.explain.procedures.length
+              ? `<p><strong>Equipped for what you described:</strong><br>` +
+                f.explain.procedures.map(escapeHtml).join("<br>") + `</p>` : "") +
+            `</div></details>`
+          : "") +
+        `</div>`;
+    }
+
+    function renderRecCards(data) {
+      const recs = data.recommendations || [];
+      const ai = data.ai || {};
+      const urgency = ai.urgency || "routine";
+      const radiusLabel = data.search_radius_km
+        ? `${Math.round(data.search_radius_km / 1.609)} miles` : "the search radius";
+      let html;
+      if (recs.length) {
+        html = `<div class="rec-header">` +
+          `<button type="button" class="close" title="Dismiss recommendations">✕</button>` +
+          `<em>${escapeHtml(urgency.toUpperCase())}</em> case — searched within ${escapeHtml(radiusLabel)}` +
+          (ai.patient_summary ? `<br>${escapeHtml(ai.patient_summary)}` : "") +
+          `</div>` + recs.map(recCardHtml).join("");
+      } else {
+        html = `<div class="rec-header">No facilities found within ${escapeHtml(radiusLabel)}.</div>`;
+      }
+      recCardsEl.innerHTML = html;
+      const closeBtn = recCardsEl.querySelector(".rec-header .close");
+      if (closeBtn) closeBtn.addEventListener("click", closeRecCards);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. "Clear markers" button: remove every marker from the map.
+    // ------------------------------------------------------------------
+    document.getElementById("clear-btn").addEventListener("click", () => {
+      markers.forEach((marker) => map.removeLayer(marker));
+      markers.length = 0;    // empty the array too
+      nearbyLayer.clearLayers();   // also remove the blue facility dots
+      resultEl.style.display = "none";
+      closeRecCards();              // and the recommendation cards
+      showStatus("", false);
+    });
+  </script>
+</body>
+</html>

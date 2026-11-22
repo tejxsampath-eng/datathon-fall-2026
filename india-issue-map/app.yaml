@@ -1,0 +1,65 @@
+# Databricks Apps configuration for the India Issue Map.
+#
+# `command` tells Databricks how to start the app (run app.py with Python).
+# `env` lists the environment variables the app reads (see app.py).
+#
+# EDIT the placeholder values below for YOUR workspace, then redeploy.
+# Never put secrets (tokens, passwords) in this file — Databricks Apps injects
+# the app's OAuth credentials (DATABRICKS_CLIENT_ID / _SECRET) automatically.
+
+command:
+  - python
+  - app.py
+
+# The Unity Gateway model service that reads the patient's description
+# and identifies the medical services needed. Declaring it as a
+# uc_securable resource grants this app's service principal EXECUTE on
+# it when the app deploys — that's what lets the app call the model.
+resources:
+  - name: model
+    uc_securable:
+      securable_full_name: system.ai.gpt-oss-120b
+      securable_type: MODEL_SERVICE
+      permission: EXECUTE
+
+env:
+  # Your workspace URL, e.g. https://adb-1234567890.0.azuredatabricks.net
+  - name: DATABRICKS_HOST
+    value: https://dbc-38a9c8ae-d3c9.cloud.databricks.com
+
+  # SQL warehouse HTTP path (Warehouse details > HTTP path),
+  # e.g. /sql/1.0/warehouses/abc123def4567890
+  - name: DATABRICKS_HTTP_PATH
+    value: /sql/1.0/warehouses/<your-warehouse-id>
+
+  # The Unity Catalog table holding the issues: catalog.schema.table.
+  # Leave empty to try the app without a table (map + geocoding still work;
+  # lookups then show "No matching issue found.").
+  - name: ISSUE_CATALOG
+    value: ""
+  - name: ISSUE_SCHEMA
+    value: ""
+  - name: ISSUE_TABLE
+    value: ""
+
+  # Column names in that table (defaults shown — edit to match your table).
+  - name: ISSUE_LOCATION_COL
+    value: location
+  - name: ISSUE_TYPE_COL
+    value: issue_type
+  - name: ISSUE_STATEMENT_COL
+    value: issue_statement
+  - name: ISSUE_LAT_COL
+    value: latitude
+  - name: ISSUE_LNG_COL
+    value: longitude
+
+  # Set to "true" to also INSERT every submitted address/issue/coordinates
+  # into the table as a new row.
+  - name: SAVE_SUBMISSIONS
+    value: "false"
+
+  # The model service used to interpret patient descriptions (injected
+  # from the uc_securable resource above — resolves to its full name).
+  - name: MODEL_SERVICE_NAME
+    valueFrom: model

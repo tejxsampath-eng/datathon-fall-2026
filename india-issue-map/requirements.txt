@@ -1,0 +1,7 @@
+# Python packages the app needs. Databricks Apps installs these
+# automatically when the app deploys.
+flask                      # the web framework serving the map page
+requests                   # HTTP calls to the Nominatim geocoding service
+databricks-sdk             # provides the app's OAuth credentials
+databricks-sql-connector>=3.0.0  # queries the SQL warehouse (3.0+ supports
+                                  # safe `?`-style parameterized queries)

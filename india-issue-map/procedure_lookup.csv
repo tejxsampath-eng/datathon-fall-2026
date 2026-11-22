@@ -1,0 +1,42 @@
+procedure,synonyms,specialty_keywords,equipment
+icu,icu;intensive care;intensive care unit;critical care unit;critical care;icu beds;icu bed,criticalcare;intensivecare,icu ventilator;ventilator;icu;patient monitor;infusion pump
+emergency,emergency department;emergency room;casualty;emergency care;emergency services;accident and emergency;emergency medicine;emergency,emergencymedicine,emergency;stretcher;ambulance;defibrillator;oxygen
+ct scan,ct scan;computed tomography;ct angiography;cat scan;ct,radiolog,ct scanner;ct;computed tomography scanner
+mri,mri;magnetic resonance;mri scan;mri machine,radiolog,mri scanner;mri;magnetic resonance
+dialysis,dialysis;haemodialysis;hemodialysis;renal dialysis;renal replacement therapy;kidney dialysis;dialysis unit,nephrolog,dialysis machine;hemodialysis machine;haemodialysis machine;dialysis;reverse osmosis
+nicu,nicu;neonatal intensive care;neonatal icu;neonatal care unit;neonatal care;newborn intensive care,neonat;pediatr,nicu;neonatal ventilator;infant warmer;phototherapy
+obstetrics,obstetrics;obstetric;antenatal;delivery;normal delivery;vaginal delivery;labour room;labor room;maternity;pregnancy care,obstetric;maternalfetal,labour room;delivery table;birthing bed;obstetric
+gynecology,gynecology;gynaecology;gynecologist;obstetrics and gynecology,gynecolog,
+blood bank,blood bank;blood storage;blood transfusion;blood donation,patholog,blood bank;blood storage;blood refrigerator
+cardiology,cardiology;cardiac care;cardiac sciences;cardiac;heart care,cardiolog,ecg machine;echo;defibrillator;cath lab;tmt
+ecg,ecg;electrocardiogram;ekg;treadmill test;tmt,cardiolog,ecg machine;ecg;defibrillator
+echo,echo;echocardiography;2d echo;echocardiogram,cardiolog,echo;ultrasound
+angioplasty,angioplasty;angiography;ptca;stent;cath lab;catheterization,cardiolog,cath lab;cathlab;angiography
+trauma care,trauma care;trauma;trauma centre;trauma center;accident care;polytrauma,trauma;emergencymedicine,trauma;emergency;stretcher
+burns unit,burns unit;burns;burn care;burn ward;burn treatment,burn,burns;burn unit;dressing
+general surgery,general surgery;operation theatre;operating theatre;laparotomy;appendectomy;hernia repair,generalsurgery,modular ot;operation theatre;ot table;anesthesia machine
+orthopedics,orthopedics;orthopaedics;orthopedic;orthopaedic;fracture;joint replacement;knee replacement;hip replacement,orthoped,c-arm;x-ray;orthopedic instruments
+cataract surgery,cataract;cataract surgery;phaco;phacoemulsification;intraocular lens;iol,ophthalmolog,phaco;phaco machine;operating microscope;iol
+ophthalmology,ophthalmology;eye care;eye hospital;eye;vision;refraction,ophthalmolog,slit lamp;phaco;oct;autorefractometer
+ent,ent;ear nose throat;otorhinolaryngology;audiometry;sinus surgery,otolaryngolog;otorhinolaryngolog,audiometry;endoscope;nasal endoscope
+oncology,oncology;cancer;cancer care;onco surgery;tumor removal;tumour removal,oncolog,linear accelerator;linac;brachytherapy;cobalt
+chemotherapy,chemotherapy;chemo,oncolog,chemotherapy
+radiotherapy,radiotherapy;radiation therapy;radiotherapy unit,oncolog,linear accelerator;linac;brachytherapy;cobalt
+stroke care,stroke;stroke unit;stroke care;thrombolysis,neurolog,ct scanner;thrombolysis
+neurosurgery,neurosurgery;neuro surgery;brain surgery;spine surgery;spinal surgery,neurosurg,neuro navigation;operating microscope
+kidney transplant,kidney transplant;renal transplant,nephrolog,
+urology,urology;lithotripsy;kidney stone;prostate surgery,urolog,lithotripter;cystoscope
+gastroenterology,gastroenterology;endoscopy;colonoscopy;gastroscopy;gastro,gastroenterolog,endoscope;colonoscope;gastroscope
+pulmonology,pulmonology;respiratory;chest disease;tuberculosis;tb,pulmonolog,spirometer
+x-ray,x-ray;xray;radiography,radiolog,x-ray;xray
+ultrasound,ultrasound;sonography;usg,radiolog,ultrasound machine;ultrasound;usg
+mammography,mammography;mammogram;breast screening,radiolog,mammogra
+physiotherapy,physiotherapy;physio;rehabilitation;rehab,physio,physiotherapy
+pediatrics,pediatrics;paediatrics;child care;children;child specialist,pediatr,
+psychiatry,psychiatry;psychiatric;mental health;counselling,psychiatr,
+dental care,dental;dentistry;tooth;teeth;oral care,dentis;endodontics;orthodontics;oralandmaxillofacial,dental chair;cbct;opg
+root canal,root canal;rct;endodontic,endodontics,dental chair;endomotor
+ambulance,ambulance;ambulance service,,ambulance
+laboratory,laboratory;lab;pathology;blood test;diagnostic,patholog,biochemistry;analyzer;centrifuge
+vaccination,vaccination;immunization;vaccine,pediatr,vaccine;refrigerator
+hiv care,hiv;aids;antiretroviral,,

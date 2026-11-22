@@ -1,0 +1,26 @@
+latitude,longitude,name,type
+28.6139,77.2090,Connaught Place,market
+19.0760,72.8777,Gateway of India,monument
+12.9716,77.5946,Cubbon Park,park
+13.0827,80.2707,Marina Beach,beach
+11.0168,76.9558,Ooty Lake,lake
+23.2599,77.4126,Upper Lake,lake
+15.2993,74.1240,Palolem Beach,beach
+27.1767,78.0081,Taj Mahal,monument
+
+NOTE (this whole file is just an example):
+- The four essential columns: latitude, longitude, name, type.
+- Optional but recommended: address, pin, city, state — if present, the
+  app geocodes each candidate's street address on the fly (cached) when
+  you submit, and ranks the best nearby facilities precisely. Without
+  them it falls back to the latitude/longitude given here.
+- Put YOUR rows in data.csv (the file next to this one) — THAT is the
+  file the app reads. This template is just a copy showing the format.
+- Column names are flexible: lat / latitude, lng / lon / longitude all
+  work. "name" can also be called label or title. "type" can be kind or
+  category. Other columns are ignored.
+- Rows without valid numbers in the latitude/longitude columns are skipped.
+- After changing data.csv, redeploy the app (or ask the assistant to)
+  and refresh the page — the running app uses the copied file.
+- If your data only has ADDRESSES (no coordinates), tell the assistant —
+  the app can geocode them for you.
